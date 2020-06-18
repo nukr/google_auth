@@ -2,8 +2,8 @@ use anyhow::{anyhow, Result};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::OpenOptions;
-use std::io::Read;
+use tokio::fs::OpenOptions;
+use tokio::prelude::*;
 
 #[derive(Deserialize, Serialize, Debug)]
 struct Credentials {
@@ -45,7 +45,9 @@ struct Claims {
     iat: u64,
 }
 
-fn get_access_token_from_service_account(service_account: ServiceAccountCredentials) -> String {
+async fn get_access_token_from_service_account(
+    service_account: ServiceAccountCredentials,
+) -> String {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
         .unwrap()
@@ -74,18 +76,19 @@ fn get_access_token_from_service_account(service_account: ServiceAccountCredenti
         String::from("urn:ietf:params:oauth:grant-type:jwt-bearer"),
     );
     form.insert(String::from("assertion"), jwt.unwrap().to_string());
-    let client = reqwest::blocking::Client::new();
+    let client = reqwest::Client::new();
     let resp = client
         .post(&service_account.token_uri)
         .form(&form)
         .send()
+        .await
         .unwrap();
-    let resp_text = resp.text().unwrap();
+    let resp_text = resp.text().await.unwrap();
     let token: Token = serde_json::from_str(&resp_text).unwrap();
     token.access_token
 }
 
-fn find_application_default_credentials() -> Credentials {
+async fn find_application_default_credentials() -> Credentials {
     let home_path = std::env::var("HOME").unwrap();
     let config_path = ".config/gcloud/application_default_credentials.json";
     let path = std::path::Path::new(&home_path).join(&config_path);
@@ -93,55 +96,48 @@ fn find_application_default_credentials() -> Credentials {
         .read(true)
         .write(false)
         .open(path)
+        .await
         .unwrap();
     let mut buf = String::new();
-    file.read_to_string(&mut buf).unwrap();
+    file.read_to_string(&mut buf).await.unwrap();
     serde_json::from_str(&buf).unwrap()
 }
 
-fn get_access_token(credentials: Credentials) -> Token {
-    let client = reqwest::blocking::Client::new();
+async fn get_access_token(credentials: Credentials) -> Token {
+    let client = reqwest::Client::new();
     let mut form: HashMap<String, String> = HashMap::new();
     form.insert(String::from("client_id"), credentials.client_id);
     form.insert(String::from("client_secret"), credentials.client_secret);
     form.insert(String::from("refresh_token"), credentials.refresh_token);
     form.insert(String::from("grant_type"), String::from("refresh_token"));
-    let mut resp = client
+    let resp = client
         .post("https://oauth2.googleapis.com/token")
         .form(&form)
         .send()
+        .await
         .unwrap();
-    let mut resp_string = String::new();
-    resp.read_to_string(&mut resp_string).unwrap();
+    let resp_string = resp.text().await.unwrap();
     serde_json::from_str(&resp_string).unwrap()
 }
 
-pub fn find_access_token() -> Result<String> {
+pub async fn find_access_token() -> Result<String> {
     if let Ok(gadc) = std::env::var("GOOGLE_APPLICATION_DEFAULT_CREDENTIAL") {
-        let mut file = match OpenOptions::new().read(true).open(gadc) {
+        let mut file = match OpenOptions::new().read(true).open(gadc).await {
             Ok(file) => file,
             Err(err) => return Err(anyhow!("open file error {}", err)),
         };
         let mut buf = String::new();
-        if let Err(err) = file.read_to_string(&mut buf) {
+        if let Err(err) = file.read_to_string(&mut buf).await {
             return Err(anyhow!("read_to_string error {}", err));
         };
         let cred: ServiceAccountCredentials = match serde_json::from_str(&buf) {
             Ok(cred) => cred,
             Err(err) => return Err(anyhow!("parse json error {}", err)),
         };
-        let access_token = get_access_token_from_service_account(cred);
+        let access_token = get_access_token_from_service_account(cred).await;
         return Ok(access_token);
     };
-    let credentials = find_application_default_credentials();
-    let token = get_access_token(credentials);
+    let credentials = find_application_default_credentials().await;
+    let token = get_access_token(credentials).await;
     Ok(token.access_token)
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn it_works() {
-        assert_eq!(2 + 2, 4);
-    }
 }
