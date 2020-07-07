@@ -59,7 +59,7 @@ struct ApplicationDefaultCredentials {
 
 #[derive(Deserialize, Serialize, Debug)]
 pub struct Token {
-    access_token: String,
+    pub access_token: String,
     expires_in: i64,
     scope: Option<String>,
     token_type: String,
