@@ -10,29 +10,20 @@ use tokio::prelude::*;
 pub struct DefaultCredentials {
     path: PathBuf,
     json: Option<Vec<u8>>,
-    token: Option<Token>,
 }
 
 impl DefaultCredentials {
     pub fn new() -> Result<Self> {
         if let Ok(gadc) = std::env::var("GOOGLE_APPLICATION_DEFAULT_CREDENTIAL") {
             let path = PathBuf::from(gadc);
-            return Ok(DefaultCredentials {
-                path,
-                json: None,
-                token: None,
-            });
+            return Ok(DefaultCredentials { path, json: None });
         }
         let home_path = std::env::var("HOME")?;
         let config_path = ".config/gcloud/application_default_credentials.json";
         let path = std::path::Path::new(&home_path).join(&config_path);
-        Ok(DefaultCredentials {
-            path,
-            json: None,
-            token: None,
-        })
+        Ok(DefaultCredentials { path, json: None })
     }
-    pub async fn token(&mut self) -> Result<&Option<Token>> {
+    pub async fn token(&mut self) -> Result<Token> {
         let mut file = match OpenOptions::new().read(true).open(&self.path).await {
             Ok(file) => file,
             Err(err) => return Err(anyhow!("open file error {}", err)),
@@ -45,8 +36,7 @@ impl DefaultCredentials {
             CredentialsType::service_account(cred) => get_token_from_service_account(cred).await?,
         };
         self.json = Some(buf);
-        self.token = Some(token);
-        Ok(&self.token)
+        Ok(token)
     }
 }
 
@@ -74,6 +64,27 @@ pub struct Token {
     scope: Option<String>,
     token_type: String,
     id_token: Option<String>,
+}
+
+impl Token {
+    pub async fn verify(&self) -> Result<()> {
+        let client = reqwest::Client::new();
+        let access_token = &self.access_token;
+        let resp = client
+            .get(&format!(
+                "https://oauth2.googleapis.com/tokeninfo?access_token={}",
+                access_token
+            ))
+            .send()
+            .await?;
+        let verify_response: VerifyResponse = resp.json().await?;
+        let expires_in: i64 = verify_response.expires_in.parse()?;
+        if expires_in > 0 {
+            Ok(())
+        } else {
+            Err(anyhow!("token expired"))
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -150,4 +161,28 @@ async fn get_token_from_adc(credentials: ApplicationDefaultCredentials) -> Resul
         .await?;
     let resp_string = resp.text().await?;
     Ok(serde_json::from_str(&resp_string)?)
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+struct VerifyResponse {
+    azp: String,
+    aud: String,
+    sub: Option<String>,
+    scope: String,
+    exp: String,
+    expires_in: String,
+    email: Option<String>,
+    email_verified: Option<String>,
+    access_type: String,
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    #[tokio::test]
+    async fn smoke_test() {
+        let mut default_credentials = DefaultCredentials::new().unwrap();
+        let token = default_credentials.token().await;
+        assert!(token.is_ok());
+    }
 }
