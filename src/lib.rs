@@ -2,11 +2,65 @@ use anyhow::{anyhow, Result};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use tokio::fs::OpenOptions;
 use tokio::prelude::*;
 
 #[derive(Deserialize, Serialize, Debug)]
-struct Credentials {
+pub struct DefaultCredentials {
+    path: PathBuf,
+    json: Option<Vec<u8>>,
+    token: Option<Token>,
+}
+
+impl DefaultCredentials {
+    pub fn new() -> Result<Self> {
+        if let Ok(gadc) = std::env::var("GOOGLE_APPLICATION_DEFAULT_CREDENTIAL") {
+            let path = PathBuf::from(gadc);
+            return Ok(DefaultCredentials {
+                path,
+                json: None,
+                token: None,
+            });
+        }
+        let home_path = std::env::var("HOME")?;
+        let config_path = ".config/gcloud/application_default_credentials.json";
+        let path = std::path::Path::new(&home_path).join(&config_path);
+        Ok(DefaultCredentials {
+            path,
+            json: None,
+            token: None,
+        })
+    }
+    pub async fn token(&mut self) -> Result<&Option<Token>> {
+        let mut file = match OpenOptions::new().read(true).open(&self.path).await {
+            Ok(file) => file,
+            Err(err) => return Err(anyhow!("open file error {}", err)),
+        };
+        let mut buf = vec![];
+        file.read_to_end(&mut buf).await?;
+        let credentials_type: CredentialsType = serde_json::from_slice(&buf)?;
+        let token = match credentials_type {
+            CredentialsType::authorized_user(cred) => get_token_from_adc(cred).await?,
+            CredentialsType::service_account(cred) => get_token_from_service_account(cred).await?,
+        };
+        self.json = Some(buf);
+        self.token = Some(token);
+        Ok(&self.token)
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(untagged)]
+enum CredentialsType {
+    #[allow(non_camel_case_types)]
+    authorized_user(ApplicationDefaultCredentials),
+    #[allow(non_camel_case_types)]
+    service_account(ServiceAccountCredentials),
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+struct ApplicationDefaultCredentials {
     client_id: String,
     client_secret: String,
     refresh_token: String,
@@ -14,7 +68,7 @@ struct Credentials {
 }
 
 #[derive(Deserialize, Serialize, Debug)]
-struct Token {
+pub struct Token {
     access_token: String,
     expires_in: i64,
     scope: Option<String>,
@@ -45,9 +99,9 @@ struct Claims {
     iat: u64,
 }
 
-async fn get_access_token_from_service_account(
+async fn get_token_from_service_account(
     service_account: ServiceAccountCredentials,
-) -> String {
+) -> Result<Token> {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
         .unwrap()
@@ -69,41 +123,20 @@ async fn get_access_token_from_service_account(
         x5t: None,
     };
     let key = EncodingKey::from_rsa_pem(service_account.private_key.as_ref()).unwrap();
-    let jwt = encode(&header, &claims, &key);
-    let mut form: HashMap<String, String> = HashMap::new();
-    form.insert(
-        String::from("grant_type"),
-        String::from("urn:ietf:params:oauth:grant-type:jwt-bearer"),
-    );
-    form.insert(String::from("assertion"), jwt.unwrap().to_string());
+    let jwt = encode(&header, &claims, &key)?;
+    let mut form: HashMap<&str, &str> = HashMap::new();
+    form.insert("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer");
+    form.insert("assertion", &jwt);
     let client = reqwest::Client::new();
     let resp = client
         .post(&service_account.token_uri)
         .form(&form)
         .send()
-        .await
-        .unwrap();
-    let resp_text = resp.text().await.unwrap();
-    let token: Token = serde_json::from_str(&resp_text).unwrap();
-    token.access_token
+        .await?;
+    Ok(resp.json::<Token>().await?)
 }
 
-async fn find_application_default_credentials() -> Credentials {
-    let home_path = std::env::var("HOME").unwrap();
-    let config_path = ".config/gcloud/application_default_credentials.json";
-    let path = std::path::Path::new(&home_path).join(&config_path);
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(false)
-        .open(path)
-        .await
-        .unwrap();
-    let mut buf = String::new();
-    file.read_to_string(&mut buf).await.unwrap();
-    serde_json::from_str(&buf).unwrap()
-}
-
-async fn get_access_token(credentials: Credentials) -> Token {
+async fn get_token_from_adc(credentials: ApplicationDefaultCredentials) -> Result<Token> {
     let client = reqwest::Client::new();
     let mut form: HashMap<String, String> = HashMap::new();
     form.insert(String::from("client_id"), credentials.client_id);
@@ -114,30 +147,7 @@ async fn get_access_token(credentials: Credentials) -> Token {
         .post("https://oauth2.googleapis.com/token")
         .form(&form)
         .send()
-        .await
-        .unwrap();
-    let resp_string = resp.text().await.unwrap();
-    serde_json::from_str(&resp_string).unwrap()
-}
-
-pub async fn find_access_token() -> Result<String> {
-    if let Ok(gadc) = std::env::var("GOOGLE_APPLICATION_DEFAULT_CREDENTIAL") {
-        let mut file = match OpenOptions::new().read(true).open(gadc).await {
-            Ok(file) => file,
-            Err(err) => return Err(anyhow!("open file error {}", err)),
-        };
-        let mut buf = String::new();
-        if let Err(err) = file.read_to_string(&mut buf).await {
-            return Err(anyhow!("read_to_string error {}", err));
-        };
-        let cred: ServiceAccountCredentials = match serde_json::from_str(&buf) {
-            Ok(cred) => cred,
-            Err(err) => return Err(anyhow!("parse json error {}", err)),
-        };
-        let access_token = get_access_token_from_service_account(cred).await;
-        return Ok(access_token);
-    };
-    let credentials = find_application_default_credentials().await;
-    let token = get_access_token(credentials).await;
-    Ok(token.access_token)
+        .await?;
+    let resp_string = resp.text().await?;
+    Ok(serde_json::from_str(&resp_string)?)
 }
