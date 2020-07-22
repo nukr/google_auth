@@ -50,10 +50,17 @@ impl DefaultCredentials {
         };
         Ok(token)
     }
+    /// https://cloud.google.com/compute/docs/storing-retrieving-metadata
     async fn from_metadata_server(&self) -> Result<Token> {
         let url = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token";
         let client = reqwest::Client::new();
-        let token = client.get(url).send().await?.json().await?;
+        let token = client
+            .get(url)
+            .header("Metadata-Flavor", "Google")
+            .send()
+            .await?
+            .json()
+            .await?;
         Ok(token)
     }
 }
