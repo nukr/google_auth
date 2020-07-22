@@ -13,8 +13,18 @@ pub struct DefaultCredentials {
 }
 
 impl DefaultCredentials {
+    /// 1. A JSON file whose path is specified by the
+    ///    GOOGLE_APPLICATION_CREDENTIALS environment variable.
+    /// 2. A JSON file in a location known to the gcloud command-line tool.
+    ///    On Windows, this is %APPDATA%/gcloud/application_default_credentials.json.
+    ///    On other systems, $HOME/.config/gcloud/application_default_credentials.json.
+    /// 3. On Google App Engine standard first generation runtimes (<= Go 1.9) it uses
+    ///    the appengine.AccessToken function.
+    /// 4. On Google Compute Engine, Google App Engine standard second generation runtimes
+    ///    (>= Go 1.11), and Google App Engine flexible environment, it fetches
+    ///    credentials from the metadata server.
     pub fn new() -> Result<Self> {
-        if let Ok(gadc) = std::env::var("GOOGLE_APPLICATION_DEFAULT_CREDENTIAL") {
+        if let Ok(gadc) = std::env::var("GOOGLE_APPLICATION_CREDENTIALS") {
             let path = PathBuf::from(gadc);
             return Ok(DefaultCredentials { path, json: None });
         }
