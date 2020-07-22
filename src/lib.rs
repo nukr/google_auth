@@ -7,12 +7,12 @@ use tokio::fs::OpenOptions;
 use tokio::prelude::*;
 
 #[derive(Deserialize, Serialize, Debug)]
-pub struct DefaultCredentials {
-    path: PathBuf,
-    json: Option<Vec<u8>>,
-}
+pub struct DefaultCredentials {}
 
 impl DefaultCredentials {
+    pub fn new() -> Self {
+        DefaultCredentials {}
+    }
     /// 1. A JSON file whose path is specified by the
     ///    GOOGLE_APPLICATION_CREDENTIALS environment variable.
     /// 2. A JSON file in a location known to the gcloud command-line tool.
@@ -23,18 +23,21 @@ impl DefaultCredentials {
     /// 4. On Google Compute Engine, Google App Engine standard second generation runtimes
     ///    (>= Go 1.11), and Google App Engine flexible environment, it fetches
     ///    credentials from the metadata server.
-    pub fn new() -> Result<Self> {
+    pub async fn token(&mut self) -> Result<Token> {
         if let Ok(gadc) = std::env::var("GOOGLE_APPLICATION_CREDENTIALS") {
             let path = PathBuf::from(gadc);
-            return Ok(DefaultCredentials { path, json: None });
+            return self.from_file(path).await;
         }
         let home_path = std::env::var("HOME")?;
         let config_path = ".config/gcloud/application_default_credentials.json";
         let path = std::path::Path::new(&home_path).join(&config_path);
-        Ok(DefaultCredentials { path, json: None })
+        if path.exists() {
+            return self.from_file(path).await;
+        }
+        self.from_metadata_server().await
     }
-    pub async fn token(&mut self) -> Result<Token> {
-        let mut file = match OpenOptions::new().read(true).open(&self.path).await {
+    async fn from_file(&self, path: PathBuf) -> Result<Token> {
+        let mut file = match OpenOptions::new().read(true).open(path).await {
             Ok(file) => file,
             Err(err) => return Err(anyhow!("open file error {}", err)),
         };
@@ -45,7 +48,12 @@ impl DefaultCredentials {
             CredentialsType::authorized_user(cred) => get_token_from_adc(cred).await?,
             CredentialsType::service_account(cred) => get_token_from_service_account(cred).await?,
         };
-        self.json = Some(buf);
+        Ok(token)
+    }
+    async fn from_metadata_server(&self) -> Result<Token> {
+        let url = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token";
+        let client = reqwest::Client::new();
+        let token = client.get(url).send().await?.json().await?;
         Ok(token)
     }
 }
@@ -191,7 +199,7 @@ mod test {
     use super::*;
     #[tokio::test]
     async fn smoke_test() {
-        let mut default_credentials = DefaultCredentials::new().unwrap();
+        let mut default_credentials = DefaultCredentials::new();
         let token = default_credentials.token().await;
         assert!(token.is_ok());
     }
